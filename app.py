@@ -41,53 +41,82 @@ if 'teks_ekstraksi' not in st.session_state:
     st.session_state.teks_ekstraksi = ""
 
 # ---------------------------------------------------------
-# 2. MESIN NLP (Diperbarui menjadi Smart Key-Takeaways)
+# 2. MESIN NLP (Diperbarui dengan Aturan Jurnalistik & Filter Noise)
 # ---------------------------------------------------------
 def proses_summarization(teks_kotor):
     start_time = time.time()
     
-    # 1. Pembersihan Teks
+    # 1. PEMBERSIHAN NOISE PORTAL BERITA
+    # Menghapus teks sampah yang sering menempel saat scraping
+    noises = [
+        r'SCROLL TO CONTINUE WITH CONTENT',
+        r'Tonton juga video.*',
+        r'Baca juga:.*',
+        r'Halaman selanjutnya.*',
+        r'\[Gambas:.*\]'
+    ]
+    for noise in noises:
+        teks_kotor = re.sub(noise, '', teks_kotor, flags=re.IGNORECASE)
+        
+    # Membersihkan spasi berlebih
     teks_bersih = re.sub(r'\s+', ' ', teks_kotor).strip()
     kalimat_list = sent_tokenize(teks_bersih)
     
     if len(kalimat_list) <= 3:
         return teks_bersih, len(teks_kotor), len(teks_bersih), round(time.time() - start_time, 2)
         
-    # 2. Menghitung Bobot Kata
+    # 2. MENGHITUNG BOBOT KATA (Term Frequency)
     stop_words = set(stopwords.words('indonesian'))
     kata_list = word_tokenize(teks_bersih.lower())
     
     frekuensi_kata = {}
     for kata in kata_list:
         if kata not in stop_words and kata.isalnum():
-            if kata not in frekuensi_kata:
-                frekuensi_kata[kata] = 1
-            else:
-                frekuensi_kata[kata] += 1
+            frekuensi_kata[kata] = frekuensi_kata.get(kata, 0) + 1
                 
     max_frekuensi = max(frekuensi_kata.values()) if frekuensi_kata else 1
     for kata in frekuensi_kata.keys():
         frekuensi_kata[kata] = frekuensi_kata[kata] / max_frekuensi
         
-    # 3. Menghitung Skor Setiap Kalimat & Menyimpan Indeks Aslinya
+    # 3. MENGHITUNG SKOR KALIMAT CERDAS (Piramida Terbalik)
     skor_kalimat = []
     for indeks, kalimat in enumerate(kalimat_list):
         skor = 0
-        for kata in word_tokenize(kalimat.lower()):
+        kata_kalimat = word_tokenize(kalimat.lower())
+        jumlah_kata = len(kata_kalimat)
+        
+        for kata in kata_kalimat:
             if kata in frekuensi_kata:
-                # Penalti untuk kalimat yang terlalu panjang agar ringkasan tetap padat
-                if len(kalimat.split(' ')) < 35: 
-                    skor += frekuensi_kata[kata]
+                skor += frekuensi_kata[kata]
+        
+        # A. Normalisasi Skor (Bagi skor dengan jumlah kata)
+        # Agar kalimat yang sekadar "panjang" tidak otomatis mengalahkan kalimat pendek yang berbobot
+        if jumlah_kata > 0:
+            skor = skor / jumlah_kata
+            
+        # B. Bobot Posisi (Sangat Penting untuk Berita)
+        # Kalimat ke-1 dan ke-2 di berita biasanya adalah inti (Lead). Kita beri bonus besar!
+        if indeks == 0:
+            skor += 2.0
+        elif indeks == 1:
+            skor += 1.0
+            
+        # C. Penalti Kalimat
+        # Kurangi skor kalimat yang terlalu pendek (biasanya sisa noise) atau terlalu panjang (bertele-tele)
+        if jumlah_kata < 6 or jumlah_kata > 40:
+            skor *= 0.5
+            
         skor_kalimat.append((skor, indeks, kalimat))
                         
-    # 4. Ekstraksi Poin-Poin Cerdas (Top 3-5 kalimat)
-    # Urutkan berdasarkan skor tertinggi untuk mencari kalimat paling penting
+    # 4. EKSTRAKSI POIN-POIN
+    # Urutkan berdasarkan skor tertinggi untuk mencari kalimat paling relevan
     skor_kalimat.sort(key=lambda x: x[0], reverse=True)
     
-    jumlah_kalimat_ringkasan = max(3, min(5, int(len(kalimat_list) * 0.3)))
+    # Ambil maksimal 4 kalimat terbaik, atau 40% dari total artikel
+    jumlah_kalimat_ringkasan = max(3, min(4, int(len(kalimat_list) * 0.4)))
     kalimat_terpilih = skor_kalimat[:jumlah_kalimat_ringkasan]
     
-    # KUNCI UTAMA: Urutkan kembali berdasarkan indeks asli agar alur ceritanya logis
+    # Urutkan kembali berdasarkan indeks asli agar alur ceritanya logis dan tidak melompat
     kalimat_terpilih.sort(key=lambda x: x[1])
     
     # Bentuk menjadi poin-poin (bullet points)
