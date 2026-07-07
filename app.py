@@ -37,17 +37,19 @@ custom_css = """
 """
 st.markdown(custom_css, unsafe_allow_html=True)
 
+# State untuk menyimpan teks utama dan judul
 if 'teks_ekstraksi' not in st.session_state:
     st.session_state.teks_ekstraksi = ""
+if 'judul_ekstraksi' not in st.session_state:
+    st.session_state.judul_ekstraksi = ""
 
 # ---------------------------------------------------------
-# 2. MESIN NLP (Diperbarui dengan Aturan Jurnalistik & Filter Noise)
+# 2. MESIN NLP (Berdasarkan Paper Badrus Zaman, 2011)
 # ---------------------------------------------------------
-def proses_summarization(teks_kotor):
+def proses_summarization(teks_kotor, judul_dokumen=""):
     start_time = time.time()
     
-    # 1. PEMBERSIHAN NOISE PORTAL BERITA
-    # Menghapus teks sampah yang sering menempel saat scraping
+    # PEMBERSIHAN NOISE (Sama seperti sebelumnya)
     noises = [
         r'SCROLL TO CONTINUE WITH CONTENT',
         r'Tonton juga video.*',
@@ -58,68 +60,81 @@ def proses_summarization(teks_kotor):
     for noise in noises:
         teks_kotor = re.sub(noise, '', teks_kotor, flags=re.IGNORECASE)
         
-    # Membersihkan spasi berlebih
     teks_bersih = re.sub(r'\s+', ' ', teks_kotor).strip()
     kalimat_list = sent_tokenize(teks_bersih)
     
     if len(kalimat_list) <= 3:
         return teks_bersih, len(teks_kotor), len(teks_bersih), round(time.time() - start_time, 2)
         
-    # 2. MENGHITUNG BOBOT KATA (Term Frequency)
+    # PERSIAPAN FITUR (Tokenisasi & Stopwords)
     stop_words = set(stopwords.words('indonesian'))
     kata_list = word_tokenize(teks_bersih.lower())
     
+    # Fitur 1: Hitung max TF
     frekuensi_kata = {}
     for kata in kata_list:
         if kata not in stop_words and kata.isalnum():
             frekuensi_kata[kata] = frekuensi_kata.get(kata, 0) + 1
-                
+            
     max_frekuensi = max(frekuensi_kata.values()) if frekuensi_kata else 1
     for kata in frekuensi_kata.keys():
         frekuensi_kata[kata] = frekuensi_kata[kata] / max_frekuensi
-        
-    # 3. MENGHITUNG SKOR KALIMAT CERDAS (Piramida Terbalik)
-    skor_kalimat = []
-    for indeks, kalimat in enumerate(kalimat_list):
-        skor = 0
-        kata_kalimat = word_tokenize(kalimat.lower())
-        jumlah_kata = len(kata_kalimat)
-        
-        for kata in kata_kalimat:
-            if kata in frekuensi_kata:
-                skor += frekuensi_kata[kata]
-        
-        # A. Normalisasi Skor (Bagi skor dengan jumlah kata)
-        # Agar kalimat yang sekadar "panjang" tidak otomatis mengalahkan kalimat pendek yang berbobot
-        if jumlah_kata > 0:
-            skor = skor / jumlah_kata
-            
-        # B. Bobot Posisi (Sangat Penting untuk Berita)
-        # Kalimat ke-1 dan ke-2 di berita biasanya adalah inti (Lead). Kita beri bonus besar!
-        if indeks == 0:
-            skor += 2.0
-        elif indeks == 1:
-            skor += 1.0
-            
-        # C. Penalti Kalimat
-        # Kurangi skor kalimat yang terlalu pendek (biasanya sisa noise) atau terlalu panjang (bertele-tele)
-        if jumlah_kata < 6 or jumlah_kata > 40:
-            skor *= 0.5
-            
-        skor_kalimat.append((skor, indeks, kalimat))
-                        
-    # 4. EKSTRAKSI POIN-POIN
-    # Urutkan berdasarkan skor tertinggi untuk mencari kalimat paling relevan
-    skor_kalimat.sort(key=lambda x: x[0], reverse=True)
+
+    # Fitur 3: Cari kalimat terpanjang untuk Panjang Relatif
+    max_panjang_kalimat = max([len(word_tokenize(k)) for k in kalimat_list]) if kalimat_list else 1
     
-    # Ambil maksimal 4 kalimat terbaik, atau 40% dari total artikel
-    jumlah_kalimat_ringkasan = max(3, min(4, int(len(kalimat_list) * 0.4)))
+    # Fitur 4: Tokenisasi judul untuk Kemiripan Judul
+    judul_tokens = set([k.lower() for k in word_tokenize(judul_dokumen) if k.isalnum() and k.lower() not in stop_words]) if judul_dokumen else set()
+
+    # MENGHITUNG 5 FITUR UNTUK SETIAP KALIMAT
+    skor_kalimat = []
+    total_kalimat = len(kalimat_list)
+    
+    for indeks, kalimat in enumerate(kalimat_list):
+        kata_kalimat_asli = word_tokenize(kalimat)
+        kata_kalimat_lower = [k.lower() for k in kata_kalimat_asli]
+        jumlah_kata = len(kata_kalimat_asli)
+        
+        if jumlah_kata == 0:
+            continue
+
+        # Fitur 1: Term Frequency (TF)
+        skor_tf = sum([frekuensi_kata.get(k, 0) for k in kata_kalimat_lower]) / jumlah_kata
+        
+        # Fitur 2: Letak Kalimat (Makin awal letaknya, nilainya mendekati 1)
+        skor_lokasi = (total_kalimat - indeks) / total_kalimat
+        
+        # Fitur 3: Panjang Relatif Kalimat
+        skor_panjang = jumlah_kata / max_panjang_kalimat
+        
+        # Fitur 4: Kemiripan dengan Judul (Irisan kata kalimat dengan kata judul)
+        skor_judul = 0
+        if judul_tokens:
+            irisan = set(kata_kalimat_lower).intersection(judul_tokens)
+            skor_judul = len(irisan) / len(judul_tokens)
+            
+        # Fitur 5: Kata Nama Diri / Proper Noun (Huruf kapital selain di awal kalimat)
+        proper_nouns = [kata for i, kata in enumerate(kata_kalimat_asli) if i > 0 and kata.istitle()]
+        skor_entitas = len(proper_nouns) / jumlah_kata
+        
+        # Total Skor (Kombinasi linear dari 5 fitur)
+        # Penambahan bobot kali 1.5 untuk lokasi karena sangat krusial di teks berita
+        skor_total = skor_tf + (skor_lokasi * 1.5) + skor_panjang + skor_judul + skor_entitas
+        
+        # Penalti untuk kalimat yang terlalu pendek (sisa noise)
+        if jumlah_kata < 6:
+            skor_total *= 0.5
+            
+        skor_kalimat.append((skor_total, indeks, kalimat))
+                        
+    # EKSTRAKSI POIN-POIN
+    skor_kalimat.sort(key=lambda x: x[0], reverse=True)
+    jumlah_kalimat_ringkasan = max(3, min(4, int(total_kalimat * 0.4)))
     kalimat_terpilih = skor_kalimat[:jumlah_kalimat_ringkasan]
     
-    # Urutkan kembali berdasarkan indeks asli agar alur ceritanya logis dan tidak melompat
+    # Urutkan kembali berdasarkan indeks asli agar narasi kronologis
     kalimat_terpilih.sort(key=lambda x: x[1])
     
-    # Bentuk menjadi poin-poin (bullet points)
     ringkasan_final = [f"• {item[2].strip()}" for item in kalimat_terpilih]
     ringkasan = "\n\n".join(ringkasan_final)
     
@@ -130,7 +145,7 @@ def proses_summarization(teks_kotor):
 # 3. ANTARMUKA WEB
 # ---------------------------------------------------------
 st.title("Sintesa: Sistem Peringkas Teks")
-st.write("Sistem otomatis akan mengekstrak ringkasan dari teks Anda.")
+st.write("Mengekstrak ringkasan berita secara otomatis menggunakan metode NLP berbasis fitur kalimat.")
 
 tab1, tab2, tab3 = st.tabs(["🔗 Link Berita", "📄 Unggah File", "✍️ Input Teks"])
 
@@ -146,6 +161,7 @@ with tab1:
                     artikel.parse()
                     if artikel.text:
                         st.session_state.teks_ekstraksi = artikel.text
+                        st.session_state.judul_ekstraksi = artikel.title # Ambil Judul Web
                         st.success(f"Berhasil menarik artikel: **{artikel.title}**")
                         st.text_area("Pratinjau Teks Asli:", st.session_state.teks_ekstraksi, height=200)
                     else:
@@ -169,13 +185,16 @@ with tab2:
             
         if teks_sementara:
             st.session_state.teks_ekstraksi = teks_sementara
-            st.success("File berhasil diekstrak! Klik Ringkas Teks di bawah.")
+            st.session_state.judul_ekstraksi = uploaded_file.name # Gunakan nama file sbg judul
+            st.success("File berhasil diekstrak! Klik Ekstrak Summarization di bawah.")
 
 # --- TAB 3: INPUT TEKS MANUAL ---
 with tab3:
+    judul_manual = st.text_input("Judul Teks (Opsional):")
     teks_manual = st.text_area("Tempel teks berita di sini:", height=250)
     if teks_manual:
         st.session_state.teks_ekstraksi = teks_manual
+        st.session_state.judul_ekstraksi = judul_manual
 
 # ---------------------------------------------------------
 # 4. EKSEKUSI & HASIL
@@ -185,8 +204,12 @@ if st.button("⚡ Ekstrak Summarization", use_container_width=True):
     if not st.session_state.teks_ekstraksi.strip():
         st.warning("Teks masih kosong. Silakan masukkan data terlebih dahulu.")
     else:
-        with st.spinner('Menganalisis dan menyusun intisari bacaan...'):
-            ringkasan, len_awal, len_akhir, waktu = proses_summarization(st.session_state.teks_ekstraksi)
+        with st.spinner('Menganalisis 5 Fitur Kalimat...'):
+            # Memasukkan Teks DAN Judul ke dalam fungsi
+            ringkasan, len_awal, len_akhir, waktu = proses_summarization(
+                st.session_state.teks_ekstraksi, 
+                st.session_state.judul_ekstraksi
+            )
             
             st.subheader("📝 Summarization:")
             st.info(ringkasan) 
